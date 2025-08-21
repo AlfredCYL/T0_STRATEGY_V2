@@ -8,7 +8,7 @@ class PortfolioState:
         self.buyhold_weights = [np.asarray(initial_weights, dtype=float).copy()]
         self.intraday_portfolio_weights = [np.asarray(initial_weights, dtype=float).copy()]
         self.cumulative_trade_pcts = [np.zeros(len(initial_weights), dtype=float)]
-        self.total_trading_frictions = [0.0]
+        self.total_trading_frictions = []
         self.pending_trade_weights = np.zeros(len(initial_weights), dtype=float)
     
     def to_dict(self):
@@ -96,12 +96,13 @@ def calculate_trading_costs(trade_amounts, portfolio_value, current_twap, prev_c
     if np.sum(trade_amounts) == 0:
         return 0.0
     
+    slippage_factor = slippage / 10000.0
     if is_final:
         trade_amounts_twap = trade_amounts * portfolio_value
     else:
         trade_amounts_twap = trade_amounts * portfolio_value * current_twap / prev_close
     
-    slippage_cost = np.sum(trade_amounts_twap) * slippage
+    slippage_cost = np.sum(trade_amounts_twap) * slippage_factor
     trade_cost = lambda_ * np.sum(trade_amounts_twap)
     
     return slippage_cost + trade_cost, trade_amounts_twap
@@ -148,24 +149,44 @@ def optimize_portfolio(optimizer, state, alpha, max_trade_pct, hold_mask, zero_m
             print(f"优化失败在时间戳 {current_ts}: {e}")
         return state.intraday_portfolio_weights[-1].copy()
 
-def execute_trade_and_calculate_costs(state, prev_close, current_close, current_twap, 
-                                    slippage, lambda_, is_final_trade=False):
-    """执行交易并计算成本的通用函数"""
-    # 执行交易指令
-    trade_amounts = execute_trades(
-        state, state.pending_trade_weights, prev_close, current_close, current_twap
-    )
+def process_first_timestep(state, close_returns):
+    """处理第一个时间步"""
+    portfolio_return = float(np.dot(state.intraday_portfolio_weights[-1], close_returns))
+    state.intraday_portfolio_values.append(state.intraday_portfolio_values[-1] * (1.0 + portfolio_return))
     
-    # 计算交易成本
-    if np.sum(trade_amounts) > 0:
+    updated_weight = state.intraday_portfolio_weights[-1] * (1.0 + close_returns)
+    updated_weight /= updated_weight.sum()
+    state.intraday_portfolio_weights.append(updated_weight.copy())
+    
+    state.total_trading_frictions.append(0.0)
+    state.cumulative_trade_pcts.append(state.cumulative_trade_pcts[-1])
+
+def execute_final_trades(state, pending_trade_weights, final_close, final_twap, 
+                        slippage_2, lambda_):
+    """执行最后一个时间戳的交易指令"""
+    if not np.any(pending_trade_weights != 0):
+        return
+    
+    actual_trade_amounts = np.abs(pending_trade_weights)
+    if np.sum(actual_trade_amounts) > 0:
         total_trading_friction, trade_amounts_twap = calculate_trading_costs(
-            trade_amounts, state.intraday_portfolio_values[-2], 
-            current_twap, prev_close, slippage, lambda_, is_final_trade
+            actual_trade_amounts, state.intraday_portfolio_values[-1], 
+            final_twap, final_close, slippage_2, lambda_, is_final=True
         )
-        update_trading_metrics(state, trade_amounts_twap, total_trading_friction, current_twap, current_close)
     else:
-        state.total_trading_frictions.append(0.0)
-        state.cumulative_trade_pcts.append(state.cumulative_trade_pcts[-1])
+        total_trading_friction = 0.0
+        trade_amounts_twap = np.zeros_like(pending_trade_weights)
+        
+    # 更新最终状态
+    state.intraday_portfolio_values[-1] -= total_trading_friction
+    state.intraday_portfolio_weights[-1] = state.buyhold_weights[-1].copy()
+    state.total_trading_frictions.append(total_trading_friction)
+    
+    # 更新累计交易比例 - 将TWAP调整至close价格
+    trade_amounts_close = trade_amounts_twap * final_close / final_twap
+    denom = np.maximum(state.buyhold_weights[-1] * state.buyhold_values[-1], 1e-8)
+    new_trade_pct = trade_amounts_close / denom
+    state.cumulative_trade_pcts[-1] = state.cumulative_trade_pcts[-1] + new_trade_pct
 
 def run_single_day_optimization(
     close_pivot, twap_pivot, alpha_pivot, hold_mask_pivot, zero_mask_pivot,
@@ -181,29 +202,43 @@ def run_single_day_optimization(
     # 初始化状态
     state = PortfolioState(initial_weights, initial_portfolio_value)
     
-    # 主循环 - 从 i=0 开始
-    for i in range(len(day_timestamps)):
+    # 主循环
+    for i in range(1, len(day_timestamps)):
+        prev_ts = day_timestamps[i - 1]
         current_ts = day_timestamps[i]
         
-        # 从 i=1 开始才处理价格更新和交易执行
-        if i >= 1:
-            prev_ts = day_timestamps[i - 1]
-            
-            # 获取价格数据
-            prev_close = close_pivot.loc[prev_ts].values
-            current_close = close_pivot.loc[current_ts].values
-            current_twap = twap_pivot.loc[current_ts].values
-            close_returns = (current_close - prev_close) / prev_close
-            
-            # 更新buyhold组合
-            update_buyhold_portfolio(state, close_returns)
-            
-            # 执行前一时刻的交易指令
-            slippage = slippage_1 if i != len(day_timestamps) - 1 else slippage_2
-            execute_trade_and_calculate_costs(state, prev_close, current_close, current_twap, 
-                                            slippage, lambda_)
+        # 获取价格数据
+        prev_close = close_pivot.loc[prev_ts].values
+        current_close = close_pivot.loc[current_ts].values
+        current_twap = twap_pivot.loc[current_ts].values
+        close_returns = (current_close - prev_close) / prev_close
         
-        # 生成新的交易指令 - 从 i=0 开始就要生成
+        # 更新buyhold组合
+        update_buyhold_portfolio(state, close_returns)
+        
+        # 处理日内交易
+        if i > 1:
+            # 执行前一时刻的交易指令
+            trade_amounts = execute_trades(
+                state, state.pending_trade_weights, prev_close, current_close, current_twap
+            )
+            
+            # 计算交易成本
+            if np.sum(trade_amounts) > 0:
+                slippage = slippage_1 if i != len(day_timestamps) - 1 else slippage_2
+                total_trading_friction, trade_amounts_twap = calculate_trading_costs(
+                    trade_amounts, state.intraday_portfolio_values[-2], 
+                    current_twap, prev_close, slippage, lambda_
+                )
+                update_trading_metrics(state, trade_amounts_twap, total_trading_friction, current_twap, current_close)
+            else:
+                state.total_trading_frictions.append(0.0)
+                state.cumulative_trade_pcts.append(state.cumulative_trade_pcts[-1])
+        else:
+            # 第一个时间步
+            process_first_timestep(state, close_returns)
+        
+        # 生成新的交易指令
         alpha = alpha_pivot.loc[current_ts].values
         zero_mask = zero_mask_pivot.loc[current_ts].values
         hold_mask = hold_mask_pivot.loc[current_ts].values
@@ -217,7 +252,7 @@ def run_single_day_optimization(
         else:
             current_max_average_turnover = max_average_turnover.loc[current_ts]
         
-        is_final = i >= len(day_timestamps) - 2
+        is_final = i == len(day_timestamps) - 1
         w_opt = optimize_portfolio(
             optimizer, state, alpha, max_trade_pct, hold_mask, zero_mask,
             cost_func, lambda_, max_turnover_ratio, current_max_average_turnover, solver, verbose,
@@ -225,4 +260,13 @@ def run_single_day_optimization(
         )
         
         state.pending_trade_weights = w_opt - state.intraday_portfolio_weights[-1]
+    
+    # 执行最后一个时间戳的交易
+    execute_final_trades(
+        state, state.pending_trade_weights, 
+        close_pivot.loc[day_timestamps[-1]].values,
+        twap_pivot.loc[day_timestamps[-1]].values,
+        slippage_2, lambda_
+    )
+    
     return state.to_dict()

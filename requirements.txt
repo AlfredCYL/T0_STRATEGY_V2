@@ -4,7 +4,11 @@ scipy>=1.7.0
 matplotlib>=3.5.0
 seaborn>=0.11.0
 scikit-learn>=1.0.0
-cvxpy>=1.2.0
+cvxpy>=1.3.0
+# 推荐的solver (可选安装)
+# gurobipy>=10.0.0  # 商业solver，性能最佳
+# mosek>=10.0.0     # 适合锥优化问题
+# osqp>=0.6.0       # 快速QP solver，已包含在cvxpy中
 pulp>=2.6.0
 tqdm>=4.62.0
 pyyaml>=6.0
