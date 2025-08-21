@@ -1,5 +1,50 @@
 import numpy as np
 
+TOLERANCE = 1e-15  # 浮点数比较容差
+POSITION_PRECISION = 1e-6 # 仓位比较容差
+
+def safe_divide(numerator, denominator, default_value=0.0):
+    """安全除法，避免除零错误"""
+    denominator = np.asarray(denominator, dtype=np.float64)
+    numerator = np.asarray(numerator, dtype=np.float64)
+    
+    # 使用 np.divide 的 where 参数来处理除零情况
+    return np.divide(numerator, denominator, 
+                    out=np.full_like(numerator, default_value, dtype=np.float64),
+                    where=np.abs(denominator) > TOLERANCE)
+
+def safe_normalize_weights(weights, min_weight=TOLERANCE):
+    """安全的权重归一化，避免精度损失"""
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = np.maximum(weights, 0.0)  # 确保非负
+    
+    total = np.sum(weights)
+    if total < min_weight:
+        # 如果总权重太小，返回均匀分布
+        return np.ones(len(weights), dtype=np.float64) / len(weights)
+    
+    normalized = weights / total
+    
+    # 确保归一化后的权重和为1（处理舍入误差）
+    normalized[-1] = 1.0 - np.sum(normalized[:-1])
+    
+    return normalized
+
+def is_close_to_zero(value, tolerance=TOLERANCE):
+    """安全的零值判断"""
+    return np.abs(value) < tolerance
+
+def clamp_to_bounds_with_tolerance(values, lower_bound=0.0, upper_bound=1.0, tolerance=TOLERANCE):
+    """将数值限制在指定范围内，对由于浮点精度导致的轻微越界进行修正"""
+    values = np.asarray(values, dtype=np.float64)
+    
+    # 处理上界越界：如果值在 (upper_bound, upper_bound + tolerance] 范围内，修正为upper_bound
+    values = np.where((values > upper_bound) & (values <= upper_bound + tolerance),upper_bound,values)
+    
+    # 处理下界越界：如果值在 [lower_bound - tolerance, lower_bound) 范围内，修正为lower_bound
+    values = np.where((values < lower_bound) & (values >= lower_bound - tolerance),lower_bound,values)
+    return values
+
 class PortfolioState:
     """组合状态管理类"""
     def __init__(self, initial_weights, initial_portfolio_value):
@@ -8,7 +53,7 @@ class PortfolioState:
         self.buyhold_weights = [np.asarray(initial_weights, dtype=float).copy()]
         self.intraday_portfolio_weights = [np.asarray(initial_weights, dtype=float).copy()]
         self.cumulative_trade_pcts = [np.zeros(len(initial_weights), dtype=float)]
-        self.total_trading_frictions = [0.0]
+        self.total_trading_frictions = [float(0)]
         self.pending_trade_weights = np.zeros(len(initial_weights), dtype=float)
     
     def to_dict(self):
@@ -25,33 +70,32 @@ def update_buyhold_portfolio(state, close_returns):
     """更新buyhold组合"""
     # 更新价值
     state.buyhold_values.append(
-        state.buyhold_values[-1] * (1.0 + float(np.dot(state.buyhold_weights[-1], close_returns)))
+        state.buyhold_values[-1] * (1.0 + np.dot(state.buyhold_weights[-1], close_returns))
     )
     
-    # 更新权重
+    # 更新权重 - 使用安全归一化
     updated_weight = state.buyhold_weights[-1] * (1.0 + close_returns)
-    updated_weight /= updated_weight.sum()
+    updated_weight = safe_normalize_weights(updated_weight)
     state.buyhold_weights.append(updated_weight.copy())
 
 def execute_trades(state, pending_trade_weights, prev_close, current_close, current_twap):
     """执行交易指令"""
     prev_weights = state.intraday_portfolio_weights[-1]
     
-    # 分离买入和卖出指令
-    sell_mask = pending_trade_weights < 0
-    buy_mask = pending_trade_weights > 0
-    hold_mask = pending_trade_weights == 0
+    # 分离买入和卖出指令 - 使用安全的零值判断
+    sell_mask = pending_trade_weights < -TOLERANCE
+    buy_mask = pending_trade_weights > TOLERANCE
+    hold_mask = is_close_to_zero(pending_trade_weights)
     
-    # 计算收益率
-    sell_returns = (current_twap - prev_close) / prev_close
-    hold_returns = (current_close - prev_close) / prev_close
-    buy_returns = (current_close - current_twap) / current_twap
+    # 计算收益率 - 使用安全除法
+    sell_returns = safe_divide(current_twap - prev_close, prev_close)
+    hold_returns = safe_divide(current_close - prev_close, prev_close)
+    buy_returns = safe_divide(current_close - current_twap, current_twap)
     
     # 执行卖出
-    sell_weights = np.abs(pending_trade_weights * sell_mask)
+    sell_weights = np.abs(pending_trade_weights * sell_mask.astype(float))
     actual_sell_weights = np.minimum(sell_weights, prev_weights)
-    sell_ratios = np.divide(actual_sell_weights, prev_weights, 
-                          out=np.zeros_like(prev_weights), where=prev_weights>0)
+    sell_ratios = safe_divide(actual_sell_weights, prev_weights)
     
     # 计算可用现金
     cash_from_sales = actual_sell_weights * (1.0 + sell_returns)
@@ -66,10 +110,10 @@ def execute_trades(state, pending_trade_weights, prev_close, current_close, curr
     # 计算最终权重
     remaining_weights = prev_weights - actual_sell_weights
     intermediate_weights = remaining_weights * (1.0 + hold_returns)
-    buy_weights_at_twap = actual_buy_weights * prev_close / current_twap
+    buy_weights_at_twap = actual_buy_weights * safe_divide(prev_close, current_twap, 1.0)
     buy_weights_final = buy_weights_at_twap * (1.0 + buy_returns)
     new_weights = intermediate_weights + buy_weights_final
-    new_weights /= new_weights.sum()
+    new_weights = safe_normalize_weights(new_weights)  # 使用安全的归一化
     
     # 计算组合收益率
     sell_weighted_returns = prev_weights * (sell_ratios * sell_returns + (1 - sell_ratios) * hold_returns)
@@ -93,13 +137,15 @@ def execute_trades(state, pending_trade_weights, prev_close, current_close, curr
 def calculate_trading_costs(trade_amounts, portfolio_value, current_twap, prev_close, 
                           slippage, lambda_, is_final=False):
     """计算交易成本"""
-    if np.sum(trade_amounts) == 0:
-        return 0.0
+    if np.sum(np.abs(trade_amounts)) < TOLERANCE:
+        return 0.0, np.zeros_like(trade_amounts)
     
     if is_final:
         trade_amounts_twap = trade_amounts * portfolio_value
     else:
-        trade_amounts_twap = trade_amounts * portfolio_value * current_twap / prev_close
+        # 使用安全除法
+        price_ratio = safe_divide(current_twap, prev_close, 1.0)
+        trade_amounts_twap = trade_amounts * portfolio_value * price_ratio
     
     slippage_cost = np.sum(trade_amounts_twap) * slippage
     trade_cost = lambda_ * np.sum(trade_amounts_twap)
@@ -112,10 +158,18 @@ def update_trading_metrics(state, trade_amounts_twap, total_trading_friction, cu
     state.intraday_portfolio_values[-1] -= total_trading_friction
     
     # 更新累计交易比例 - 将TWAP调整至close价格
-    trade_amounts_close = trade_amounts_twap * current_close / current_twap
-    denom = np.maximum(state.buyhold_weights[-1] * state.buyhold_values[-1], 1e-8)
-    new_trade_pct = trade_amounts_close / denom
-    state.cumulative_trade_pcts.append(state.cumulative_trade_pcts[-1] + new_trade_pct)
+    # 使用安全除法进行价格调整
+    price_adjustment = safe_divide(current_close, current_twap, 1.0)
+    trade_amounts_close = trade_amounts_twap * price_adjustment
+    
+    # 计算交易比例，使用更高精度
+    denominator = state.buyhold_weights[-1] * state.buyhold_values[-1]
+    new_trade_pct = safe_divide(trade_amounts_close, denominator)
+    updated_trade_pct = state.cumulative_trade_pcts[-1] + new_trade_pct
+    
+    # 处理精度问题
+    updated_trade_pct = clamp_to_bounds_with_tolerance(updated_trade_pct, lower_bound=0.0, upper_bound=1.0, tolerance=POSITION_PRECISION)
+    state.cumulative_trade_pcts.append(updated_trade_pct)
 
 def optimize_portfolio(optimizer, state, alpha, max_trade_pct, hold_mask, zero_mask, 
                       cost_func, lambda_, max_turnover_ratio, max_average_turnover, solver, verbose, 
@@ -144,8 +198,7 @@ def optimize_portfolio(optimizer, state, alpha, max_trade_pct, hold_mask, zero_m
         )
         return w_opt
     except Exception as e:
-        if verbose:
-            print(f"优化失败在时间戳 {current_ts}: {e}")
+        print(f"优化失败在时间戳 {current_ts}: {e}")
         return state.intraday_portfolio_weights[-1].copy()
 
 def execute_trade_and_calculate_costs(state, prev_close, current_close, current_twap, 
