@@ -83,7 +83,7 @@ class PortfolioOptimizer:
         dw = w - w0
 
         if cost_func is None:
-            cost = cp.norm1(dw)  # L1 交易成本
+            cost = cp.norm1(dw, p=1)  # L1 交易成本
         else:
             cost = cost_func(dw)
 
